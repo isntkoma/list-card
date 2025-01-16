@@ -1,227 +1,173 @@
-console.log(`%clist-card\n%cVersion: ${'0.0.1'}`, 'color: rebeccapurple; font-weight: bold;', '');
+"""Feedparser sensor"""
+from __future__ import annotations
 
-class ListCard extends HTMLElement {
+import asyncio
+import re
+from datetime import timedelta
 
-    constructor() {
-      super();
-      this.attachShadow({ mode: 'open' });
+import homeassistant.helpers.config_validation as cv
+import voluptuous as vol
+from dateutil import parser
+from homeassistant.components.sensor import PLATFORM_SCHEMA, SensorEntity
+from homeassistant.const import CONF_NAME, CONF_SCAN_INTERVAL
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+import homeassistant.util.dt as dt
+
+import feedparser
+
+__version__ = "0.1.12"
+
+COMPONENT_REPO = "https://github.com/custom-components/sensor.feedparser/"
+
+REQUIREMENTS = ["feedparser"]
+
+CONF_FEED_URL = "feed_url"
+CONF_DATE_FORMAT = "date_format"
+CONF_LOCAL_TIME = "local_time"
+CONF_INCLUSIONS = "inclusions"
+CONF_EXCLUSIONS = "exclusions"
+CONF_SHOW_TOPN = "show_topn"
+
+DEFAULT_SCAN_INTERVAL = timedelta(hours=1)
+
+PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+    {
+        vol.Required(CONF_NAME): cv.string,
+        vol.Required(CONF_FEED_URL): cv.string,
+        vol.Required(CONF_DATE_FORMAT, default="%a, %b %d %I:%M %p"): cv.string,
+        vol.Optional(CONF_LOCAL_TIME, default=False): cv.boolean,
+        vol.Optional(CONF_SHOW_TOPN, default=9999): cv.positive_int,
+        vol.Optional(CONF_INCLUSIONS, default=[]): vol.All(cv.ensure_list, [cv.string]),
+        vol.Optional(CONF_EXCLUSIONS, default=[]): vol.All(cv.ensure_list, [cv.string]),
+        vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): cv.time_period,
     }
+)
 
-    setConfig(config) {
-      if (!config.entity) {
-        throw new Error('Please define an entity');
-      }
 
-      const root = this.shadowRoot;
-      if (root.lastChild) root.removeChild(root.lastChild);
+"""@asyncio.coroutine"""
+async def async_setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    async_add_devices: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
+    async_add_devices(
+        [
+            FeedParserSensor(
+                feed=config[CONF_FEED_URL],
+                name=config[CONF_NAME],
+                date_format=config[CONF_DATE_FORMAT],
+                local_time=config[CONF_LOCAL_TIME],
+                show_topn=config[CONF_SHOW_TOPN],
+                inclusions=config[CONF_INCLUSIONS],
+                exclusions=config[CONF_EXCLUSIONS],
+                scan_interval=config[CONF_SCAN_INTERVAL],
+            )
+        ],
+        True,
+    )
 
-      const cardConfig = Object.assign({}, config);
-      const columns = cardConfig.columns;
-      const card = document.createElement('ha-card');
-      const content = document.createElement('div');
-      const style = document.createElement('style');
-      style.textContent = `
-            ha-card {
-              /* sample css */
-            }
-            table {
-              width: 100%;
-              padding: 0 16px 16px 16px;
-            }
-            thead th {
-              text-align: left;
-            }
-            tbody tr:nth-child(odd) {
-              background-color: var(--paper-card-background-color);
-            }
-            tbody tr:nth-child(even) {
-              background-color: var(--secondary-background-color);
-            }
-            .button {
-              overflow: auto;
-              padding: 16px;
-            }
-            paper-button {
-              float: right;
-            }
-            td a {
-              color: var(--primary-text-color);
-              text-decoration-line: none;
-              font-weight: normal;
-            }
-          `;
 
-      // Go through columns and add CSS sytling to each column that is defined
-      if (columns) {
-        for (let column in columns) {
-          if (columns.hasOwnProperty(column) && columns[column].hasOwnProperty('style')) {
-            let styles = columns[column]['style'];
+class FeedParserSensor(SensorEntity):
+    def __init__(
+        self,
+        feed: str,
+        name: str,
+        date_format: str,
+        local_time: bool,
+        show_topn: str,
+        exclusions: str,
+        inclusions: str,
+        scan_interval: int,
+    ) -> None:
+        self._feed = feed
+        self._attr_name = name
+        self._attr_icon = "mdi:rss"
+        self._date_format = date_format
+        self._show_topn = show_topn
+        self._local_time = local_time
+        self._inclusions = inclusions
+        self._exclusions = exclusions
+        self._scan_interval = scan_interval
+        self._attr_state = None
+        self._entries = []
+        self._attr_extra_state_attributes = {"entries": self._entries}
 
-            style.textContent += `
-              .${columns[column].field} {`
+    def update(self):
+        parsed_feed = feedparser.parse(self._feed)
 
-            for (let index in styles) {
-              if (styles.hasOwnProperty(index)) {
-                for (let s in styles[index]) {
-                  style.textContent += `
-                  ${s}: ${styles[index][s]};`;
-                }
-              }
-            }
+        if not parsed_feed:
+            return False
+        else:
+            self._attr_state = (
+                self._show_topn
+                if len(parsed_feed.entries) > self._show_topn
+                else len(parsed_feed.entries)
+            )
+            self._entries = []
 
-            style.textContent += `}`;
-          }
-        }
-      }
+            for entry in parsed_feed.entries[: self._attr_state]:
+                entry_value = {}
 
-      content.id = "container";
-      cardConfig.title ? card.header = cardConfig.title : null;
-      card.appendChild(content);
-      card.appendChild(style);
-      root.appendChild(card);
-      this._config = cardConfig;
-    }
+                for key, value in entry.items():
+                    if (
+                        (self._inclusions and key not in self._inclusions)
+                        or ("parsed" in key)
+                        or (key in self._exclusions)
+                    ):
+                        continue
+                    if key in ["published", "updated", "created", "expired"]:
+                        value = parser.parse(value)
+                        if self._local_time:
+                            value = dt.as_local(value)
+                        value = value.strftime(self._date_format)
 
-    set hass(hass) {
-      const config = this._config;
-      const root = this.shadowRoot;
-      const card = root.lastChild;
+                    entry_value[key] = value
 
-      if (hass.states[config.entity]) {
-        const feed = config.feed_attribute ? hass.states[config.entity].attributes[config.feed_attribute] : hass.states[config.entity].attributes;
-        const columns = config.columns;
-        this.style.display = 'block';
-        const rowLimit = config.row_limit ? config.row_limit : Object.keys(feed).length;
-        let rows = 0;
+                # Extract media:thumbnail or media:image if present
+                if "media_thumbnail" in entry.keys():
+                    thumbnails = entry["media_thumbnail"]
+                    if isinstance(thumbnails, list) and thumbnails:
+                        thumbnail = thumbnails[0]
+                        entry_value["image"] = thumbnail.get("url")
+                        entry_value["image_width"] = thumbnail.get("width", "unknown")
+                        entry_value["image_height"] = thumbnail.get("height", "unknown")
 
-        if (feed !== undefined && Object.keys(feed).length > 0) {
-          let card_content = '<table><thread><tr>';
+                elif "media_content" in entry.keys():
+                    media_content = entry["media_content"]
+                    if isinstance(media_content, list) and media_content:
+                        media = media_content[0]
+                        entry_value["image"] = media.get("url")
+                        entry_value["image_width"] = media.get("width", "unknown")
+                        entry_value["image_height"] = media.get("height", "unknown")
 
-          if (!columns) {
-            card_content += `<tr>`;
+                # Fallback: Extract image from the summary
+                if "image" in self._inclusions and "image" not in entry_value.keys():
+                    images = []
+                    if "summary" in entry.keys():
+                        images = re.findall(
+                            r"<img.+?src=\"(.+?)\".+?>", entry["summary"]
+                        )
+                    if images:
+                        entry_value["image"] = images[0]
+                        entry_value["image_width"] = "unknown"
+                        entry_value["image_height"] = "unknown"
+                    else:
+                        entry_value["image"] = (
+                            "https://www.home-assistant.io/images/favicon-192x192-full.png"
+                        )
+                        entry_value["image_width"] = "192"
+                        entry_value["image_height"] = "192"
 
-            for (let column in feed[0]) {
-              if (feed[0].hasOwnProperty(column)) {
-                card_content += `<th>${feed[0][column]}</th>`;
-              }
-            }
-          } else {
-            for (let column in columns) {
-              if (columns.hasOwnProperty(column)) {
-                card_content += `<th class=${columns[column].field}>${columns[column].title}</th>`;
-              }
-            }
-          }
+                self._entries.append(entry_value)
 
-          card_content += `</tr></thead><tbody>`;
+    @property
+    def state(self):
+        """Return the state of the sensor."""
+        return self._attr_state
 
-          for (let entry in feed) {
-            if (rows >= rowLimit) break;
-
-            if (feed.hasOwnProperty(entry)) {
-              if (!columns) {
-                for (let field in feed[entry]) {
-                  if (feed[entry].hasOwnProperty(field)) {
-                    card_content += `<td>${feed[entry][field]}</td>`;
-                  }
-                }
-              } else {
-                let has_field = true;
-
-                for (let column in columns) {
-                  if (!feed[entry].hasOwnProperty(columns[column].field)) {
-                    has_field = false;
-                    break;
-                  }
-                }
-
-                if (!has_field) continue;
-                card_content += `<tr>`;
-
-                for (let column in columns) {
-                  if (columns.hasOwnProperty(column)) {
-                    card_content += `<td class=${columns[column].field}>`;
-
-                    if (columns[column].hasOwnProperty('add_link')) {
-                      card_content +=  `<a href="${feed[entry][columns[column].add_link]}" target='_blank'>`;
-                    }
-
-                    if (columns[column].hasOwnProperty('type')) {
-                      if (columns[column].type === 'image') {
-                        if (columns[column].hasOwnProperty('width')) {
-                          var image_width = columns[column].width;
-                        } else {
-                          var image_width = 70;
-                        }
-                        if (columns[column].hasOwnProperty('height')) {
-                          var image_height = columns[column].height;
-                        } else {
-                          var image_height = 90;
-                        }
-                        if (feed[entry][columns[column].field][0].hasOwnProperty('url')) {
-                            var url = feed[entry][columns[column].field][0].url
-                        } else {
-                          var url = feed[entry][columns[column].field]
-                        }
-                          card_content += `<img id="image" src="${url}" width="${image_width}" height="${image_height}">`;
-                      } else if (columns[column].type === 'icon') {
-                        card_content += `<ha-icon class="column-${columns[column].field}" icon=${feed[entry][columns[column].field]}></ha-icon>`;
-                      }
-                      // else if (columns[column].type === 'button') {
-                      //   card_content += `<paper-button raised>${feed[entry][columns[column].button_text]}</paper-button>`;
-                      // }
-                    } else {
-                      let newText = feed[entry][columns[column].field];
-
-                      if (columns[column].hasOwnProperty('regex')) {
-                        newText = new RegExp(columns[column].regex, 'u').exec(feed[entry][columns[column].field]);
-                      } 
-                      if (columns[column].hasOwnProperty('prefix')) {
-                        newText = columns[column].prefix + newText;
-                      } 
-                      if (columns[column].hasOwnProperty('postfix')) {
-                        newText += columns[column].postfix;
-                      }
-
-                      card_content += `${newText}`;
-                    }
-
-                    if (columns[column].hasOwnProperty('add_link')) {
-                      card_content +=  `</a>`;
-                    }
-
-                    card_content += `</td>`;
-                  }
-                }
-              }
-
-              card_content += `</tr>`;
-              ++rows;
-            }
-          }
-
-          root.lastChild.hass = hass;
-          card_content += `</tbody></table>`;
-          root.getElementById('container').innerHTML = card_content;
-        } else {
-          this.style.display = 'none';
-        }
-      } else {
-        this.style.display = 'none';
-      }
-    }
-
-    getCardSize() {
-      return 1;
-    }
-  }
-
-  customElements.define('list-card', ListCard);
-
-window.customCards = window.customCards || [];
-window.customCards.push({
-  type: "list-card",
-  name: "List Card",
-  preview: false,
-  description: "The List Card generate table with data from sensor that provides data as a list of attributes."
-});
+    @property
+    def extra_state_attributes(self):
+        return {"entries": self._entries}
